@@ -155,6 +155,29 @@
         "contracts",
         "bootstrap"
       ]
+    },
+    {
+      "id": "measurement-units",
+      "name": "Measurement units and quantity interpretation",
+      "entry": "POST /units",
+      "steps": [
+        "steward registers units with dimension and conversion basis",
+        "case fixes its target quantity in one registered unit",
+        "measurements convert compatible units and reject unknown or incompatible ones",
+        "rule revisions never rewrite confirmed measurements or sealed evidence"
+      ],
+      "success": "submitted and adopted quantities are stored and restored by reads and events",
+      "failure": "returns unknown_unit, incompatible_unit, or duplicate_unit errors",
+      "verification": "workflowcheck registers units, converts mV and K submissions, rejects bad units, revises a rule, and verifies history is unchanged",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
     }
   ],
   "complexity": {

@@ -14,6 +14,7 @@ type Repository struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	units        map[string]domain.UnitDefinition
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -24,6 +25,7 @@ func New() *Repository {
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
+		units:        make(map[string]domain.UnitDefinition),
 		counters:     make(map[string]int),
 	}
 }
@@ -33,6 +35,7 @@ type Snapshot struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	units        map[string]domain.UnitDefinition
 	events       []domain.AuditEvent
 }
 
@@ -62,6 +65,19 @@ func (s Snapshot) Measurements(caseID string) []domain.Measurement {
 func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
 	item, ok := s.seals[caseID]
 	return item, ok
+}
+
+func (s Snapshot) Unit(symbol string) (domain.UnitDefinition, bool) {
+	item, ok := s.units[symbol]
+	return item, ok
+}
+
+func (s Snapshot) AllUnits() []domain.UnitDefinition {
+	result := make([]domain.UnitDefinition, 0, len(s.units))
+	for _, item := range s.units {
+		result = append(result, item)
+	}
+	return result
 }
 
 func (s Snapshot) Events(caseID string) []domain.AuditEvent {
@@ -95,6 +111,7 @@ type Mutation struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	units        map[string]domain.UnitDefinition
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -189,6 +206,27 @@ func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
 	return nil
 }
 
+func (m *Mutation) Unit(symbol string) (domain.UnitDefinition, bool) {
+	item, ok := m.units[symbol]
+	return item, ok
+}
+
+func (m *Mutation) PutUnit(item domain.UnitDefinition) error {
+	if _, exists := m.units[item.Symbol]; exists {
+		return fmt.Errorf("%w: unit %s", domain.ErrDuplicateUnit, item.Symbol)
+	}
+	m.units[item.Symbol] = item
+	return nil
+}
+
+func (m *Mutation) UpdateUnit(item domain.UnitDefinition) error {
+	if _, exists := m.units[item.Symbol]; !exists {
+		return fmt.Errorf("%w: unit %s", domain.ErrNotFound, item.Symbol)
+	}
+	m.units[item.Symbol] = item
+	return nil
+}
+
 func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 	m.events = append(m.events, item)
 }
@@ -224,6 +262,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		units:        cloneUnits(r.units),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
 	}
@@ -234,6 +273,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
+	r.units = next.units
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -245,6 +285,7 @@ func (r *Repository) snapshot() Snapshot {
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		units:        cloneUnits(r.units),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 	}
 }
@@ -275,6 +316,14 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 
 func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
 	result := make(map[string]domain.EvidenceSeal, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneUnits(values map[string]domain.UnitDefinition) map[string]domain.UnitDefinition {
+	result := make(map[string]domain.UnitDefinition, len(values))
 	for key, value := range values {
 		result[key] = value
 	}

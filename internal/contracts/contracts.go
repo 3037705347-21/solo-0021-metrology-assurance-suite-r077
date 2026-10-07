@@ -9,15 +9,33 @@ type RegisterDeviceRequest struct {
 	Steward  string `json:"steward"`
 }
 
+type RegisterUnitRequest struct {
+	Symbol     string  `json:"symbol"`
+	Dimension  string  `json:"dimension"`
+	Scale      float64 `json:"scale"`
+	Offset     float64 `json:"offset"`
+	Basis      string  `json:"basis"`
+	Maintainer string  `json:"maintainer"`
+}
+
+type ReviseUnitRequest struct {
+	Scale      float64 `json:"scale"`
+	Offset     float64 `json:"offset"`
+	Basis      string  `json:"basis"`
+	Maintainer string  `json:"maintainer"`
+}
+
 type OpenCaseRequest struct {
 	DeviceID  string  `json:"device_id"`
 	Nominal   float64 `json:"nominal"`
 	Tolerance float64 `json:"tolerance"`
+	Unit      string  `json:"unit"`
 	Steward   string  `json:"steward"`
 }
 
 type RecordMeasurementRequest struct {
 	Observed   float64 `json:"observed"`
+	Unit       string  `json:"unit"`
 	Technician string  `json:"technician"`
 }
 
@@ -33,6 +51,14 @@ type SealCaseRequest struct {
 
 type DeviceResponse struct {
 	Device domain.Device `json:"device"`
+}
+
+type UnitResponse struct {
+	Unit domain.UnitDefinition `json:"unit"`
+}
+
+type UnitsResponse struct {
+	Units []domain.UnitDefinition `json:"units"`
 }
 
 type CaseResponse struct {

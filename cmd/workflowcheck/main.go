@@ -40,6 +40,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"measurement-units":        checkMeasurementUnits,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -116,11 +117,14 @@ func checkOpenVerificationCase() error {
 	h := newHarness()
 	defer h.close()
 
+	if err := h.mustRegisterUnit("V", "voltage", 1, 0, "SI derived unit"); err != nil {
+		return err
+	}
 	deviceID, err := h.createDevice("MET-1101")
 	if err != nil {
 		return err
 	}
-	opened, err := h.openCase(deviceID)
+	opened, err := h.openCase(deviceID, "V", 25.0, 0.5)
 	if err != nil {
 		return err
 	}
@@ -135,6 +139,13 @@ func checkOpenVerificationCase() error {
 	if state != "awaiting_measurement" {
 		return fmt.Errorf("opened case state = %q", state)
 	}
+	unit, err := nestedString(opened.Body, "case", "unit")
+	if err != nil {
+		return err
+	}
+	if unit != "V" {
+		return fmt.Errorf("opened case unit = %q", unit)
+	}
 
 	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
 	if err != nil {
@@ -148,6 +159,7 @@ func checkOpenVerificationCase() error {
 		"device_id": deviceID,
 		"nominal":   25.0,
 		"tolerance": 0.5,
+		"unit":      "V",
 		"steward":   "Qiao",
 	})
 	if err != nil {
@@ -163,11 +175,14 @@ func checkRecordMeasurement() error {
 	h := newHarness()
 	defer h.close()
 
+	if err := h.mustRegisterUnit("V", "voltage", 1, 0, "SI derived unit"); err != nil {
+		return err
+	}
 	deviceID, err := h.createDevice("MET-1201")
 	if err != nil {
 		return err
 	}
-	opened, err := h.openCase(deviceID)
+	opened, err := h.openCase(deviceID, "V", 25.0, 0.5)
 	if err != nil {
 		return err
 	}
@@ -175,7 +190,7 @@ func checkRecordMeasurement() error {
 	if err != nil {
 		return err
 	}
-	accepted, err := h.recordMeasurement(caseID, 25.2, "Rui")
+	accepted, err := h.recordMeasurement(caseID, 25.2, "V", "Rui")
 	if err != nil {
 		return err
 	}
@@ -197,7 +212,7 @@ func checkRecordMeasurement() error {
 		return errors.New("in-tolerance measurement was not accepted")
 	}
 
-	second, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	second, err := h.recordMeasurement(caseID, 25.1, "V", "Rui")
 	if err != nil {
 		return err
 	}
@@ -212,7 +227,7 @@ func checkRecordMeasurement() error {
 	if err != nil {
 		return err
 	}
-	rejectCase, err := h.openCase(rejectDeviceID)
+	rejectCase, err := h.openCase(rejectDeviceID, "V", 25.0, 0.5)
 	if err != nil {
 		return err
 	}
@@ -220,7 +235,7 @@ func checkRecordMeasurement() error {
 	if err != nil {
 		return err
 	}
-	rejected, err := h.recordMeasurement(rejectCaseID, 26.5, "Rui")
+	rejected, err := h.recordMeasurement(rejectCaseID, 26.5, "V", "Rui")
 	if err != nil {
 		return err
 	}
@@ -375,6 +390,252 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkMeasurementUnits() error {
+	h := newHarness()
+	defer h.close()
+
+	// The steward maintains the available dimensions and conversion bases.
+	if err := h.mustRegisterUnit("V", "voltage", 1, 0, "SI derived unit"); err != nil {
+		return err
+	}
+	if err := h.mustRegisterUnit("mV", "voltage", 0.001, 0, "SI milli prefix"); err != nil {
+		return err
+	}
+	if err := h.mustRegisterUnit("K", "temperature", 1, 0, "SI base unit"); err != nil {
+		return err
+	}
+	if err := h.mustRegisterUnit("°C", "temperature", 1, 273.15, "Celsius offset from kelvin"); err != nil {
+		return err
+	}
+	duplicate, err := h.registerUnit("V", "voltage", 1, 0, "duplicate definition")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(duplicate, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(duplicate, "duplicate_unit"); err != nil {
+		return err
+	}
+	listed, err := h.request(http.MethodGet, "/units", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(listed, http.StatusOK); err != nil {
+		return err
+	}
+	units, err := nestedSlice(listed.Body, "units")
+	if err != nil {
+		return err
+	}
+	if len(units) != 4 {
+		return fmt.Errorf("registered units = %d, expected 4", len(units))
+	}
+
+	// A case fixes its target quantity: nominal and tolerance in one unit.
+	deviceA, err := h.createDevice("MET-1501")
+	if err != nil {
+		return err
+	}
+	openedA, err := h.openCase(deviceA, "V", 0.25, 0.01)
+	if err != nil {
+		return err
+	}
+	caseA, err := nestedString(openedA.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	dimension, err := nestedString(openedA.Body, "case", "dimension")
+	if err != nil {
+		return err
+	}
+	if dimension != "voltage" {
+		return fmt.Errorf("case dimension = %q", dimension)
+	}
+
+	// A measurement submitted in mV is adopted in the case unit V.
+	recorded, err := h.recordMeasurement(caseA, 249.5, "mV", "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(recorded, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := expectMeasurement(recorded.Body, 249.5, "mV", 0.2495, "V", -0.0005, true); err != nil {
+		return err
+	}
+
+	// Sealing snapshots the adopted quantity into the evidence record.
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseA+"/seal", map[string]any{
+		"reviewer": "Wei",
+		"summary":  "accepted measurement sealed for review",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := expectSealQuantity(sealed.Body, 0.2495, "V", -0.0005); err != nil {
+		return err
+	}
+
+	// The steward revises the mV conversion rule afterwards.
+	revised, err := h.request(http.MethodPut, "/units/mV", map[string]any{
+		"scale":      0.0011,
+		"offset":     0,
+		"basis":      "corrected calibration factor",
+		"maintainer": "Lin",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(revised, http.StatusOK); err != nil {
+		return err
+	}
+	revision, err := nestedFloat(revised.Body, "unit", "revision")
+	if err != nil {
+		return err
+	}
+	if revision != 2 {
+		return fmt.Errorf("mV revision = %v, expected 2", revision)
+	}
+
+	// The revision must not rewrite the confirmed measurement or the seal.
+	reread, err := h.request(http.MethodGet, "/cases/"+caseA, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reread, http.StatusOK); err != nil {
+		return err
+	}
+	if err := expectMeasurement(reread.Body, 249.5, "mV", 0.2495, "V", -0.0005, true); err != nil {
+		return fmt.Errorf("revision rewrote history: %w", err)
+	}
+	if err := expectSealQuantity(reread.Body, 0.2495, "V", -0.0005); err != nil {
+		return fmt.Errorf("revision rewrote the seal: %w", err)
+	}
+
+	// Unknown and incompatible units are rejected explicitly, never silently.
+	deviceB, err := h.createDevice("MET-1502")
+	if err != nil {
+		return err
+	}
+	openedB, err := h.openCase(deviceB, "V", 0.25, 0.01)
+	if err != nil {
+		return err
+	}
+	caseB, err := nestedString(openedB.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	unknown, err := h.recordMeasurement(caseB, 1.0, "furlong", "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(unknown, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(unknown, "unknown_unit"); err != nil {
+		return err
+	}
+	incompatible, err := h.recordMeasurement(caseB, 250.0, "K", "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(incompatible, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(incompatible, "incompatible_unit"); err != nil {
+		return err
+	}
+	missing, err := h.request(http.MethodPost, "/cases/"+caseB+"/measurements", map[string]any{
+		"observed":   250.0,
+		"technician": "Rui",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missing, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(missing, "invalid_input"); err != nil {
+		return err
+	}
+	deviceD, err := h.createDevice("MET-1504")
+	if err != nil {
+		return err
+	}
+	unknownCaseUnit, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id": deviceD,
+		"nominal":   1.0,
+		"tolerance": 0.1,
+		"unit":      "furlong",
+		"steward":   "Qiao",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(unknownCaseUnit, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(unknownCaseUnit, "unknown_unit"); err != nil {
+		return err
+	}
+
+	// New measurements use the revised rule: 253 mV is now 0.2783 V.
+	revisedRule, err := h.recordMeasurement(caseB, 253.0, "mV", "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(revisedRule, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := expectMeasurement(revisedRule.Body, 253.0, "mV", 0.2783, "V", 0.0283, false); err != nil {
+		return err
+	}
+
+	// Affine conversion: 298 K is adopted as 24.85 °C on a Celsius case.
+	deviceC, err := h.createDevice("MET-1503")
+	if err != nil {
+		return err
+	}
+	openedC, err := h.openCase(deviceC, "°C", 25.0, 0.5)
+	if err != nil {
+		return err
+	}
+	caseC, err := nestedString(openedC.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	celsius, err := h.recordMeasurement(caseC, 298.0, "K", "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(celsius, http.StatusCreated); err != nil {
+		return err
+	}
+	if err := expectMeasurement(celsius.Body, 298.0, "K", 24.85, "°C", -0.15, true); err != nil {
+		return err
+	}
+
+	// The audit trail restores the submitted and adopted quantities.
+	events, err := h.request(http.MethodGet, "/cases/"+caseA+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(events, http.StatusOK); err != nil {
+		return err
+	}
+	if !eventDetailContains(events.Body, "measurement_accepted", "249.5 mV") {
+		return errors.New("measurement event does not restore the submitted quantity")
+	}
+	if !eventDetailContains(events.Body, "measurement_accepted", "0.2495 V") {
+		return errors.New("measurement event does not restore the adopted quantity")
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -440,11 +701,31 @@ func (h *harness) createDevice(tag string) (string, error) {
 	return nestedString(response.Body, "device", "id")
 }
 
-func (h *harness) openCase(deviceID string) (apiResponse, error) {
+func (h *harness) registerUnit(symbol, dimension string, scale, offset float64, basis string) (apiResponse, error) {
+	return h.request(http.MethodPost, "/units", map[string]any{
+		"symbol":     symbol,
+		"dimension":  dimension,
+		"scale":      scale,
+		"offset":     offset,
+		"basis":      basis,
+		"maintainer": "Lin",
+	})
+}
+
+func (h *harness) mustRegisterUnit(symbol, dimension string, scale, offset float64, basis string) error {
+	response, err := h.registerUnit(symbol, dimension, scale, offset, basis)
+	if err != nil {
+		return err
+	}
+	return expectStatus(response, http.StatusCreated)
+}
+
+func (h *harness) openCase(deviceID, unit string, nominal, tolerance float64) (apiResponse, error) {
 	response, err := h.request(http.MethodPost, "/cases", map[string]any{
 		"device_id": deviceID,
-		"nominal":   25.0,
-		"tolerance": 0.5,
+		"nominal":   nominal,
+		"tolerance": tolerance,
+		"unit":      unit,
 		"steward":   "Qiao",
 	})
 	if err != nil {
@@ -456,19 +737,23 @@ func (h *harness) openCase(deviceID string) (apiResponse, error) {
 	return response, nil
 }
 
-func (h *harness) recordMeasurement(caseID string, observed float64, technician string) (apiResponse, error) {
+func (h *harness) recordMeasurement(caseID string, observed float64, unit, technician string) (apiResponse, error) {
 	return h.request(http.MethodPost, "/cases/"+caseID+"/measurements", map[string]any{
 		"observed":   observed,
+		"unit":       unit,
 		"technician": technician,
 	})
 }
 
 func (h *harness) rejectedCase(tag string) (string, error) {
+	if err := h.mustRegisterUnit("V", "voltage", 1, 0, "SI derived unit"); err != nil {
+		return "", err
+	}
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
 		return "", err
 	}
-	opened, err := h.openCase(deviceID)
+	opened, err := h.openCase(deviceID, "V", 25.0, 0.5)
 	if err != nil {
 		return "", err
 	}
@@ -476,7 +761,7 @@ func (h *harness) rejectedCase(tag string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	response, err := h.recordMeasurement(caseID, 26.5, "Rui")
+	response, err := h.recordMeasurement(caseID, 26.5, "V", "Rui")
 	if err != nil {
 		return "", err
 	}
@@ -487,11 +772,14 @@ func (h *harness) rejectedCase(tag string) (string, error) {
 }
 
 func (h *harness) readyCase(tag string) (string, error) {
+	if err := h.mustRegisterUnit("V", "voltage", 1, 0, "SI derived unit"); err != nil {
+		return "", err
+	}
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
 		return "", err
 	}
-	opened, err := h.openCase(deviceID)
+	opened, err := h.openCase(deviceID, "V", 25.0, 0.5)
 	if err != nil {
 		return "", err
 	}
@@ -499,7 +787,7 @@ func (h *harness) readyCase(tag string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	response, err := h.recordMeasurement(caseID, 25.2, "Rui")
+	response, err := h.recordMeasurement(caseID, 25.2, "V", "Rui")
 	if err != nil {
 		return "", err
 	}
@@ -549,6 +837,138 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 		return false, fmt.Errorf("%v is not a boolean", path)
 	}
 	return flag, nil
+}
+
+func nestedFloat(root map[string]any, path ...any) (float64, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return number, nil
+}
+
+func expectNear(actual, expected float64, label string) error {
+	const tolerance = 1e-9
+	diff := actual - expected
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > tolerance {
+		return fmt.Errorf("%s = %v, expected %v", label, actual, expected)
+	}
+	return nil
+}
+
+func expectMeasurement(body map[string]any, observed float64, observedUnit string, adopted float64, unit string, deviation float64, accepted bool) error {
+	value, err := nestedFloat(body, "measurements", 0, "observed")
+	if err != nil {
+		return err
+	}
+	if err := expectNear(value, observed, "observed"); err != nil {
+		return err
+	}
+	symbol, err := measurementString(body, "observed_unit")
+	if err != nil {
+		return err
+	}
+	if symbol != observedUnit {
+		return fmt.Errorf("observed_unit = %q, expected %q", symbol, observedUnit)
+	}
+	value, err = nestedFloat(body, "measurements", 0, "adopted")
+	if err != nil {
+		return err
+	}
+	if err := expectNear(value, adopted, "adopted"); err != nil {
+		return err
+	}
+	caseUnit, err := measurementString(body, "unit")
+	if err != nil {
+		return err
+	}
+	if caseUnit != unit {
+		return fmt.Errorf("unit = %q, expected %q", caseUnit, unit)
+	}
+	value, err = nestedFloat(body, "measurements", 0, "deviation")
+	if err != nil {
+		return err
+	}
+	if err := expectNear(value, deviation, "deviation"); err != nil {
+		return err
+	}
+	flag, err := nestedBool(body, "measurements", 0, "accepted")
+	if err != nil {
+		return err
+	}
+	if flag != accepted {
+		return fmt.Errorf("accepted = %v, expected %v", flag, accepted)
+	}
+	return nil
+}
+
+func measurementString(body map[string]any, key string) (string, error) {
+	items, err := nestedSlice(body, "measurements")
+	if err != nil {
+		return "", err
+	}
+	if len(items) == 0 {
+		return "", errors.New("measurements is empty")
+	}
+	entry, ok := items[0].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("measurements[0] is not an object")
+	}
+	value, ok := entry[key].(string)
+	if !ok {
+		return "", fmt.Errorf("measurements[0].%s is not a string", key)
+	}
+	return value, nil
+}
+
+func expectSealQuantity(body map[string]any, adopted float64, unit string, deviation float64) error {
+	value, err := nestedFloat(body, "seal", "adopted_value")
+	if err != nil {
+		return err
+	}
+	if err := expectNear(value, adopted, "seal adopted_value"); err != nil {
+		return err
+	}
+	symbol, err := nestedString(body, "seal", "unit")
+	if err != nil {
+		return err
+	}
+	if symbol != unit {
+		return fmt.Errorf("seal unit = %q, expected %q", symbol, unit)
+	}
+	value, err = nestedFloat(body, "seal", "deviation")
+	if err != nil {
+		return err
+	}
+	return expectNear(value, deviation, "seal deviation")
+}
+
+func eventDetailContains(root map[string]any, kind string, fragment string) bool {
+	items, err := nestedSlice(root, "events")
+	if err != nil {
+		return false
+	}
+	for _, item := range items {
+		event, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if event["kind"] != kind {
+			continue
+		}
+		detail, ok := event["detail"].(string)
+		if ok && strings.Contains(detail, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func nestedSlice(root map[string]any, key string) ([]any, error) {

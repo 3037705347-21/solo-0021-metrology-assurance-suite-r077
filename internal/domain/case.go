@@ -21,6 +21,8 @@ type VerificationCase struct {
 	DeviceID  string     `json:"device_id"`
 	Nominal   float64    `json:"nominal"`
 	Tolerance float64    `json:"tolerance"`
+	Unit      string     `json:"unit"`
+	Dimension string     `json:"dimension"`
 	Steward   string     `json:"steward"`
 	State     CaseState  `json:"state"`
 	Version   int        `json:"version"`
@@ -29,12 +31,14 @@ type VerificationCase struct {
 	SealedAt  *time.Time `json:"sealed_at,omitempty"`
 }
 
-func NewVerificationCase(id, deviceID string, nominal, tolerance float64, steward string, at time.Time) (VerificationCase, error) {
+func NewVerificationCase(id, deviceID string, nominal, tolerance float64, unit, dimension, steward string, at time.Time) (VerificationCase, error) {
 	item := VerificationCase{
 		ID:        strings.TrimSpace(id),
 		DeviceID:  strings.TrimSpace(deviceID),
 		Nominal:   nominal,
 		Tolerance: tolerance,
+		Unit:      NormalizeUnitSymbol(unit),
+		Dimension: NormalizeDimension(dimension),
 		Steward:   strings.TrimSpace(steward),
 		State:     CaseAwaitingMeasurement,
 		Version:   1,
@@ -50,6 +54,9 @@ func NewVerificationCase(id, deviceID string, nominal, tolerance float64, stewar
 func (c VerificationCase) Validate() error {
 	if c.ID == "" || c.DeviceID == "" || c.Steward == "" {
 		return fmt.Errorf("%w: case id, device id, and steward are required", ErrInvalidInput)
+	}
+	if c.Unit == "" || c.Dimension == "" {
+		return fmt.Errorf("%w: case unit and dimension are required", ErrInvalidInput)
 	}
 	if !isFinite(c.Nominal) || !isFinite(c.Tolerance) || c.Tolerance <= 0 {
 		return fmt.Errorf("%w: nominal must be finite and tolerance must be positive", ErrInvalidInput)

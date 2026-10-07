@@ -22,6 +22,7 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow measurement-units
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the
@@ -31,11 +32,26 @@ Tests are intentionally deferred for this initialization baseline. The later
 engineering-task stage will add the unit and integration test suite and replace
 or extend these smoke checks with red/green verification tests.
 
+## Units Of Measure
+
+Stewards register the available units of measure and the basis for each
+conversion rule (`POST /units`, `PUT /units/{symbol}`). A verification case
+fixes its target quantity as a nominal value and tolerance in one registered
+unit. Measurements must name their unit: compatible units are converted into
+the case unit, while unknown or dimension-incompatible units are rejected with
+explicit `unknown_unit` / `incompatible_unit` errors. Recorded measurements
+and sealed evidence keep the submitted and adopted quantities they were
+confirmed with, so later conversion-rule revisions never rewrite history.
+
 ## API
 
 - `GET /healthz`
 - `POST /devices`
 - `GET /devices/{id}`
+- `POST /units`
+- `GET /units`
+- `GET /units/{symbol}`
+- `PUT /units/{symbol}`
 - `POST /cases`
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`

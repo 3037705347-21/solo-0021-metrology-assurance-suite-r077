@@ -3,6 +3,7 @@ package assurance
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -77,6 +78,109 @@ func (s *Service) Device(ctx context.Context, id string) (domain.Device, error) 
 	return found, err
 }
 
+func (s *Service) RegisterUnit(ctx context.Context, input contracts.RegisterUnitRequest) (domain.UnitDefinition, error) {
+	var created domain.UnitDefinition
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		symbol := domain.NormalizeUnitSymbol(input.Symbol)
+		if _, exists := m.Unit(symbol); exists {
+			return fmt.Errorf("%w: %s", domain.ErrDuplicateUnit, symbol)
+		}
+		item, err := domain.NewUnitDefinition(
+			input.Symbol,
+			input.Dimension,
+			input.Scale,
+			input.Offset,
+			input.Basis,
+			input.Maintainer,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.PutUnit(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"unit",
+			item.Symbol,
+			"",
+			"unit_registered",
+			item.Maintainer,
+			fmt.Sprintf("unit %s registered for dimension %s: canonical = %g * value + %g (%s)",
+				item.Symbol, item.Dimension, item.Scale, item.Offset, item.Basis),
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		created = item
+		return nil
+	})
+	return created, err
+}
+
+func (s *Service) ReviseUnit(ctx context.Context, symbol string, input contracts.ReviseUnitRequest) (domain.UnitDefinition, error) {
+	var revised domain.UnitDefinition
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		item, exists := m.Unit(domain.NormalizeUnitSymbol(symbol))
+		if !exists {
+			return fmt.Errorf("%w: unit %s", domain.ErrNotFound, symbol)
+		}
+		if err := item.Revise(input.Scale, input.Offset, input.Basis, input.Maintainer, s.now()); err != nil {
+			return err
+		}
+		if err := m.UpdateUnit(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"unit",
+			item.Symbol,
+			"",
+			"unit_revised",
+			item.Maintainer,
+			fmt.Sprintf("unit %s revised to revision %d: canonical = %g * value + %g (%s)",
+				item.Symbol, item.Revision, item.Scale, item.Offset, item.Basis),
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		revised = item
+		return nil
+	})
+	return revised, err
+}
+
+func (s *Service) Unit(ctx context.Context, symbol string) (domain.UnitDefinition, error) {
+	var found domain.UnitDefinition
+	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
+		item, exists := snapshot.Unit(domain.NormalizeUnitSymbol(symbol))
+		if !exists {
+			return fmt.Errorf("%w: unit %s", domain.ErrNotFound, symbol)
+		}
+		found = item
+		return nil
+	})
+	return found, err
+}
+
+func (s *Service) Units(ctx context.Context) ([]domain.UnitDefinition, error) {
+	var result []domain.UnitDefinition
+	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
+		result = snapshot.AllUnits()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Symbol < result[j].Symbol })
+	return result, nil
+}
+
 func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
@@ -91,11 +195,17 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if active, exists := m.ActiveCaseForDevice(device.ID); exists {
 			return fmt.Errorf("%w: case %s is still %s", domain.ErrActiveCaseExists, active.ID, active.State)
 		}
+		unit, err := requireUnit(m, input.Unit)
+		if err != nil {
+			return err
+		}
 		item, err := domain.NewVerificationCase(
 			m.NextID("case"),
 			device.ID,
 			input.Nominal,
 			input.Tolerance,
+			unit.Symbol,
+			unit.Dimension,
 			input.Steward,
 			s.now(),
 		)
@@ -112,7 +222,8 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			item.ID,
 			"case_opened",
 			item.Steward,
-			"verification case opened",
+			fmt.Sprintf("verification case opened: nominal %g %s, tolerance %g %s, dimension %s",
+				item.Nominal, item.Unit, item.Tolerance, item.Unit, item.Dimension),
 			s.now(),
 		)
 		if err != nil {
@@ -146,10 +257,29 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		submitted, err := requireUnit(m, input.Unit)
+		if err != nil {
+			return err
+		}
+		if submitted.Dimension != item.Dimension {
+			return fmt.Errorf("%w: case %s targets dimension %s but submitted unit %s is %s",
+				domain.ErrIncompatibleUnit, item.ID, item.Dimension, submitted.Symbol, submitted.Dimension)
+		}
+		caseUnit, exists := m.Unit(item.Unit)
+		if !exists {
+			return fmt.Errorf("%w: case unit %s", domain.ErrUnknownUnit, item.Unit)
+		}
+		adopted, err := domain.ConvertValue(input.Observed, submitted, caseUnit)
+		if err != nil {
+			return err
+		}
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
 			input.Observed,
+			submitted.Symbol,
+			adopted,
+			caseUnit.Symbol,
 			item.Nominal,
 			item.Tolerance,
 			input.Technician,
@@ -168,10 +298,14 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			return err
 		}
 		kind := "measurement_rejected"
-		detail := "measurement exceeded tolerance and requires another measurement"
+		detail := fmt.Sprintf("observed %g %s adopted as %g %s; deviation %+g %s exceeds tolerance %g %s",
+			measurement.Observed, measurement.ObservedUnit, measurement.Adopted, measurement.Unit,
+			measurement.Deviation, measurement.Unit, measurement.Tolerance, measurement.Unit)
 		if measurement.Accepted {
 			kind = "measurement_accepted"
-			detail = "measurement is within tolerance and ready for review"
+			detail = fmt.Sprintf("observed %g %s adopted as %g %s; deviation %+g %s within tolerance %g %s",
+				measurement.Observed, measurement.ObservedUnit, measurement.Adopted, measurement.Unit,
+				measurement.Deviation, measurement.Unit, measurement.Tolerance, measurement.Unit)
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -257,6 +391,9 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			measurement.ID,
 			input.Reviewer,
 			input.Summary,
+			measurement.Adopted,
+			measurement.Unit,
+			measurement.Deviation,
 			s.now(),
 		)
 		if err != nil {
@@ -275,7 +412,8 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			item.ID,
 			"case_sealed",
 			seal.Reviewer,
-			seal.Summary,
+			fmt.Sprintf("%s; sealed value %g %s, deviation %+g %s",
+				seal.Summary, seal.AdoptedValue, seal.Unit, seal.Deviation, seal.Unit),
 			s.now(),
 		)
 		if err != nil {
@@ -301,6 +439,21 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 		}
 	}
 	return selected, found
+}
+
+// requireUnit resolves a submitted unit symbol against the registry. A blank
+// symbol is invalid input and an unregistered symbol is an unknown unit;
+// neither is silently accepted.
+func requireUnit(m *repository.Mutation, symbol string) (domain.UnitDefinition, error) {
+	normalized := domain.NormalizeUnitSymbol(symbol)
+	if normalized == "" {
+		return domain.UnitDefinition{}, fmt.Errorf("%w: unit is required", domain.ErrInvalidInput)
+	}
+	unit, exists := m.Unit(normalized)
+	if !exists {
+		return domain.UnitDefinition{}, fmt.Errorf("%w: %s", domain.ErrUnknownUnit, normalized)
+	}
+	return unit, nil
 }
 
 func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
