@@ -33,6 +33,43 @@ func (s *Server) device(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, contracts.DeviceResponse{Device: device})
 }
 
+func (s *Server) registerUnit(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.RegisterUnitRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	unit, err := s.service.RegisterUnit(request.Context(), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, contracts.UnitResponse{Unit: unit})
+}
+
+func (s *Server) listUnits(writer http.ResponseWriter, request *http.Request) {
+	units, err := s.service.Units(request.Context())
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, contracts.UnitsResponse{Units: units})
+}
+
+func (s *Server) reviseUnit(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.ReviseUnitRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	unit, err := s.service.ReviseUnit(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusOK, contracts.UnitResponse{Unit: unit})
+}
+
 func (s *Server) openCase(writer http.ResponseWriter, request *http.Request) {
 	input, err := decodeJSON[contracts.OpenCaseRequest](writer, request)
 	if err != nil {

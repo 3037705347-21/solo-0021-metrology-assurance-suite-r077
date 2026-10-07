@@ -11,6 +11,7 @@ import (
 type Repository struct {
 	mu           sync.RWMutex
 	devices      map[string]domain.Device
+	units        map[string]domain.Unit
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
@@ -21,6 +22,7 @@ type Repository struct {
 func New() *Repository {
 	return &Repository{
 		devices:      make(map[string]domain.Device),
+		units:        make(map[string]domain.Unit),
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
@@ -30,6 +32,7 @@ func New() *Repository {
 
 type Snapshot struct {
 	devices      map[string]domain.Device
+	units        map[string]domain.Unit
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
@@ -48,6 +51,28 @@ func (s Snapshot) DeviceByTag(tag string) (domain.Device, bool) {
 		}
 	}
 	return domain.Device{}, false
+}
+
+func (s Snapshot) Unit(id string) (domain.Unit, bool) {
+	item, ok := s.units[id]
+	return item, ok
+}
+
+func (s Snapshot) UnitBySymbol(symbol string) (domain.Unit, bool) {
+	for _, item := range s.units {
+		if item.Symbol == symbol {
+			return item, true
+		}
+	}
+	return domain.Unit{}, false
+}
+
+func (s Snapshot) AllUnits() []domain.Unit {
+	result := make([]domain.Unit, 0, len(s.units))
+	for _, item := range s.units {
+		result = append(result, item)
+	}
+	return result
 }
 
 func (s Snapshot) Case(id string) (domain.VerificationCase, bool) {
@@ -92,6 +117,7 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 
 type Mutation struct {
 	devices      map[string]domain.Device
+	units        map[string]domain.Unit
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
@@ -131,6 +157,44 @@ func (m *Mutation) UpdateDevice(item domain.Device) error {
 		return fmt.Errorf("%w: device %s", domain.ErrNotFound, item.ID)
 	}
 	m.devices[item.ID] = item
+	return nil
+}
+
+func (m *Mutation) Unit(id string) (domain.Unit, bool) {
+	item, ok := m.units[id]
+	return item, ok
+}
+
+func (m *Mutation) UnitBySymbol(symbol string) (domain.Unit, bool) {
+	for _, item := range m.units {
+		if item.Symbol == symbol {
+			return item, true
+		}
+	}
+	return domain.Unit{}, false
+}
+
+func (m *Mutation) AllUnits() []domain.Unit {
+	result := make([]domain.Unit, 0, len(m.units))
+	for _, item := range m.units {
+		result = append(result, item)
+	}
+	return result
+}
+
+func (m *Mutation) PutUnit(item domain.Unit) error {
+	if _, exists := m.units[item.ID]; exists {
+		return fmt.Errorf("%w: unit %s", domain.ErrStateConflict, item.ID)
+	}
+	m.units[item.ID] = item
+	return nil
+}
+
+func (m *Mutation) UpdateUnit(item domain.Unit) error {
+	if _, exists := m.units[item.ID]; !exists {
+		return fmt.Errorf("%w: unit %s", domain.ErrNotFound, item.ID)
+	}
+	m.units[item.ID] = item
 	return nil
 }
 
@@ -221,6 +285,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 
 	next := &Mutation{
 		devices:      cloneDevices(r.devices),
+		units:        cloneUnits(r.units),
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
@@ -231,6 +296,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		return err
 	}
 	r.devices = next.devices
+	r.units = next.units
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
@@ -242,6 +308,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 func (r *Repository) snapshot() Snapshot {
 	return Snapshot{
 		devices:      cloneDevices(r.devices),
+		units:        cloneUnits(r.units),
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
@@ -251,6 +318,14 @@ func (r *Repository) snapshot() Snapshot {
 
 func cloneDevices(values map[string]domain.Device) map[string]domain.Device {
 	result := make(map[string]domain.Device, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneUnits(values map[string]domain.Unit) map[string]domain.Unit {
+	result := make(map[string]domain.Unit, len(values))
 	for key, value := range values {
 		result[key] = value
 	}

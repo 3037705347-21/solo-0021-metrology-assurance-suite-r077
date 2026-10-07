@@ -3,6 +3,8 @@ package assurance
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,6 +79,115 @@ func (s *Service) Device(ctx context.Context, id string) (domain.Device, error) 
 	return found, err
 }
 
+// RegisterUnit adds a unit to the steward-maintained registry. The first
+// unit of a dimension must be its canonical reference (factor 1, offset 0);
+// every later unit of the dimension carries an affine conversion basis to
+// that reference.
+func (s *Service) RegisterUnit(ctx context.Context, input contracts.RegisterUnitRequest) (domain.Unit, error) {
+	var created domain.Unit
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		symbol := domain.NormalizeUnitSymbol(input.Symbol)
+		dimension := domain.NormalizeDimension(input.Dimension)
+		if _, exists := m.UnitBySymbol(symbol); exists {
+			return fmt.Errorf("%w: %s", domain.ErrDuplicateUnitSymbol, symbol)
+		}
+		canonical, hasCanonical := canonicalUnitForDimension(m.AllUnits(), dimension)
+		switch {
+		case !hasCanonical && (input.Factor != 1 || input.Offset != 0):
+			return fmt.Errorf("%w: first unit of dimension %s must be the canonical reference with factor 1 and offset 0", domain.ErrInvalidInput, dimension)
+		case hasCanonical && input.Factor == 1 && input.Offset == 0:
+			return fmt.Errorf("%w: dimension %s already has canonical unit %s", domain.ErrInvalidInput, dimension, canonical.Symbol)
+		}
+		item, err := domain.NewUnit(m.NextID("unit"), symbol, dimension, input.Factor, input.Offset, s.now())
+		if err != nil {
+			return err
+		}
+		steward := strings.TrimSpace(input.Steward)
+		if steward == "" {
+			return fmt.Errorf("%w: steward is required", domain.ErrInvalidInput)
+		}
+		if err := m.PutUnit(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"unit",
+			item.ID,
+			"",
+			"unit_registered",
+			steward,
+			fmt.Sprintf("unit %s registered for dimension %s (canonical = value * %s + %s)",
+				item.Symbol, item.Dimension, formatNumber(item.Factor), formatNumber(item.Offset)),
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		created = item
+		return nil
+	})
+	return created, err
+}
+
+func (s *Service) Units(ctx context.Context) ([]domain.Unit, error) {
+	var result []domain.Unit
+	err := s.repository.Read(ctx, func(snapshot repository.Snapshot) error {
+		result = snapshot.AllUnits()
+		slices.SortFunc(result, func(a, b domain.Unit) int {
+			return strings.Compare(a.ID, b.ID)
+		})
+		return nil
+	})
+	return result, err
+}
+
+// ReviseUnit replaces the conversion basis of a non-canonical unit. Cases
+// fix their target at open time and measurements snapshot the basis at
+// submission, so a revision never rewrites confirmed quantities or seals.
+func (s *Service) ReviseUnit(ctx context.Context, id string, input contracts.ReviseUnitRequest) (domain.Unit, error) {
+	var revised domain.Unit
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		item, exists := m.Unit(strings.TrimSpace(id))
+		if !exists {
+			return fmt.Errorf("%w: unit %s", domain.ErrNotFound, id)
+		}
+		previousFactor, previousOffset := item.Factor, item.Offset
+		if err := item.Revise(input.Factor, input.Offset, s.now()); err != nil {
+			return err
+		}
+		actor := strings.TrimSpace(input.Actor)
+		if actor == "" {
+			return fmt.Errorf("%w: actor is required", domain.ErrInvalidInput)
+		}
+		if err := m.UpdateUnit(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"unit",
+			item.ID,
+			"",
+			"unit_revised",
+			actor,
+			fmt.Sprintf("unit %s conversion revised from factor %s offset %s to factor %s offset %s; confirmed measurements keep their recorded basis",
+				item.Symbol, formatNumber(previousFactor), formatNumber(previousOffset),
+				formatNumber(item.Factor), formatNumber(item.Offset)),
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		revised = item
+		return nil
+	})
+	return revised, err
+}
+
+// OpenCase fixes the target quantity of the case. The submitted nominal and
+// tolerance are converted into the canonical unit of their dimension once,
+// at open time, and are never recomputed afterwards.
 func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
@@ -91,11 +202,30 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if active, exists := m.ActiveCaseForDevice(device.ID); exists {
 			return fmt.Errorf("%w: case %s is still %s", domain.ErrActiveCaseExists, active.ID, active.State)
 		}
+		nominalUnit, err := requireUnit(m, input.NominalUnit)
+		if err != nil {
+			return err
+		}
+		toleranceSymbol := domain.NormalizeUnitSymbol(input.ToleranceUnit)
+		if toleranceSymbol == "" {
+			toleranceSymbol = nominalUnit.Symbol
+		}
+		toleranceUnit, err := requireUnit(m, toleranceSymbol)
+		if err != nil {
+			return err
+		}
+		canonical, hasCanonical := canonicalUnitForDimension(m.AllUnits(), nominalUnit.Dimension)
+		if !hasCanonical {
+			return fmt.Errorf("canonical unit missing for dimension %s", nominalUnit.Dimension)
+		}
 		item, err := domain.NewVerificationCase(
 			m.NextID("case"),
 			device.ID,
 			input.Nominal,
 			input.Tolerance,
+			nominalUnit,
+			toleranceUnit,
+			canonical.Symbol,
 			input.Steward,
 			s.now(),
 		)
@@ -112,7 +242,11 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			item.ID,
 			"case_opened",
 			item.Steward,
-			"verification case opened",
+			fmt.Sprintf("verification case opened: nominal %s, tolerance %s, adopted target %s ± %s",
+				formatQuantity(item.SubmittedNominal, item.NominalUnit),
+				formatQuantity(item.SubmittedTolerance, item.ToleranceUnit),
+				formatQuantity(item.Nominal, item.CanonicalUnit),
+				formatQuantity(item.Tolerance, item.CanonicalUnit)),
 			s.now(),
 		)
 		if err != nil {
@@ -138,6 +272,10 @@ func (s *Service) Case(ctx context.Context, id string) (contracts.CaseResponse, 
 	return result, err
 }
 
+// RecordMeasurement adopts the submitted quantity into the canonical unit
+// of the case dimension. The measurement keeps the submitted value and unit
+// together with the conversion basis used at submission, so reads and
+// events always restore the quantities as they were recorded.
 func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input contracts.RecordMeasurementRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
@@ -146,12 +284,22 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		unit, err := requireUnit(m, input.Unit)
+		if err != nil {
+			return err
+		}
+		if unit.Dimension != item.Dimension {
+			return fmt.Errorf("%w: case %s targets dimension %s but unit %s is %s",
+				domain.ErrIncompatibleUnit, item.ID, item.Dimension, unit.Symbol, unit.Dimension)
+		}
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
 			input.Observed,
+			unit,
 			item.Nominal,
 			item.Tolerance,
+			item.CanonicalUnit,
 			input.Technician,
 			s.now(),
 		)
@@ -168,10 +316,14 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			return err
 		}
 		kind := "measurement_rejected"
-		detail := "measurement exceeded tolerance and requires another measurement"
+		detail := fmt.Sprintf("measurement %s adopted as %s exceeded tolerance and requires another measurement",
+			formatQuantity(measurement.Submitted, measurement.Unit),
+			formatQuantity(measurement.Observed, measurement.CanonicalUnit))
 		if measurement.Accepted {
 			kind = "measurement_accepted"
-			detail = "measurement is within tolerance and ready for review"
+			detail = fmt.Sprintf("measurement %s adopted as %s is within tolerance and ready for review",
+				formatQuantity(measurement.Submitted, measurement.Unit),
+				formatQuantity(measurement.Observed, measurement.CanonicalUnit))
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -232,6 +384,10 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 	return result, err
 }
 
+// SealCase selects the accepted measurement with the smallest absolute
+// canonical deviation recorded at submission. Sealing never reconverts
+// quantities, so the sealed evidence keeps the physical fact that was
+// confirmed when each measurement was submitted.
 func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.SealCaseRequest) (contracts.CaseResponse, error) {
 	var result contracts.CaseResponse
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
@@ -301,6 +457,38 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 		}
 	}
 	return selected, found
+}
+
+// requireUnit resolves a submitted unit symbol against the registry. A
+// missing symbol is invalid input and an unregistered symbol is rejected as
+// an unknown unit; neither is ever silently defaulted.
+func requireUnit(m *repository.Mutation, symbol string) (domain.Unit, error) {
+	normalized := domain.NormalizeUnitSymbol(symbol)
+	if normalized == "" {
+		return domain.Unit{}, fmt.Errorf("%w: unit is required", domain.ErrInvalidInput)
+	}
+	unit, exists := m.UnitBySymbol(normalized)
+	if !exists {
+		return domain.Unit{}, fmt.Errorf("%w: %s", domain.ErrUnknownUnit, normalized)
+	}
+	return unit, nil
+}
+
+func canonicalUnitForDimension(units []domain.Unit, dimension string) (domain.Unit, bool) {
+	for _, item := range units {
+		if item.Dimension == dimension && item.IsCanonical() {
+			return item, true
+		}
+	}
+	return domain.Unit{}, false
+}
+
+func formatNumber(value float64) string {
+	return strconv.FormatFloat(value, 'g', -1, 64)
+}
+
+func formatQuantity(value float64, unit string) string {
+	return formatNumber(value) + " " + unit
 }
 
 func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
